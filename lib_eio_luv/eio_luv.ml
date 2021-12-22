@@ -665,10 +665,9 @@ let rec run ?mode main =
   let async = Luv.Async.init ~loop (fun _async -> wakeup run_q) |> or_raise in
   let st = { loop; async; run_q } in
   let stdenv = Objects.stdenv ~run_event_loop:(run ?mode) in
-  let rec fork ~tid ~cancel:initial_cancel fn =
-    Ctf.note_switch tid;
-    let fibre = Fibre_context.make ~cc:initial_cancel in
-    match_with fn fibre
+  let rec fork ~new_fibre:fibre fn =
+    Ctf.note_switch (Fibre_context.tid fibre);
+    match_with fn ()
     { retc = (fun () -> Fibre_context.destroy fibre);
       exnc = (fun e -> Fibre_context.destroy fibre; raise e);
       effc = fun (type a) (e : a eff) ->
