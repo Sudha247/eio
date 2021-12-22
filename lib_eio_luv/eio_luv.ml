@@ -121,6 +121,26 @@ let await_with_cancel ~request fn =
         )
     )
 
+let await_with_cancel_poll ~poll fn =
+  enter (fun st k ->
+    let cancel_reason = ref None in
+    Eio.Private.Fibre_context.set_cancel_fn k.fibre (fun ex ->
+      cancel_reason := Some ex;
+      match Luv.Poll.stop poll with
+      | Ok () -> ()
+      | Error e -> Log.debug (fun f -> f "Cancel failed: %s" (Luv.Error.strerror e)));
+
+      fn st.loop (fun v ->
+        if Eio.Private.Fibre_context.clear_cancel_fn k.fibre then (
+          enqueue_thread st k v
+        ) else (
+          (* Cancellations always come from the same domain, so we can be sure
+             that [cancel_reason] is set by now. *)
+          enqueue_failed_thread st k (Option.get !cancel_reason)
+        )
+      )
+    )
+
 let get_loop () =
   enter_unchecked @@ fun t k ->
   Suspended.continue k t.loop
@@ -221,6 +241,32 @@ module File = struct
   let mkdir ~mode path =
     let request = Luv.File.Request.make () in
     await_with_cancel ~request (fun loop -> Luv.File.mkdir ~loop ~request ~mode path)
+
+
+  let await_readable fd f =
+    let p = Luv.Poll.init ~loop:(get_loop ()) (Obj.magic fd) in
+    match p with
+    | Ok poll ->
+      let _ = await_with_cancel_poll ~poll (fun _loop _fibre -> Luv.Poll.start poll [`READABLE;] (fun _ -> f ())) in
+      lazy(
+        match Luv.Poll.stop poll with
+        | Ok () -> ()
+        | Error _e -> failwith "error"
+      )
+    | Error _e -> failwith "error"
+
+  let await_writable fd f =
+    let p = Luv.Poll.init ~loop:(get_loop ()) (Obj.magic fd) in
+    match p with
+    | Ok poll ->
+      let _ = await_with_cancel_poll ~poll (fun _loop _fibre -> Luv.Poll.start poll [`WRITABLE;] (fun _ -> f ())) in
+      lazy(
+        match Luv.Poll.stop poll with
+        | Ok () -> ()
+        | Error _e -> failwith "error"
+      )
+    | Error _e -> failwith "error"
+
 end
 
 module Stream = struct
@@ -616,13 +662,13 @@ let rec wakeup run_q =
   | Some f -> f (); wakeup run_q
   | None -> ()
 
-let rec run main =
+let rec run ?mode main =
   Log.debug (fun l -> l "starting run");
   let loop = Luv.Loop.init () |> or_raise in
   let run_q = Lf_queue.create () in
   let async = Luv.Async.init ~loop (fun _async -> wakeup run_q) |> or_raise in
   let st = { loop; async; run_q } in
-  let stdenv = Objects.stdenv ~run_event_loop:run in
+  let stdenv = Objects.stdenv ~run_event_loop:(run ?mode) in
   let rec fork ~tid ~cancel:initial_cancel fn =
     Ctf.note_switch tid;
     let fibre = Fibre_context.make ~tid ~cc:initial_cancel in
@@ -692,7 +738,7 @@ let rec run main =
       end;
       Luv.Loop.stop loop
     );
-  ignore (Luv.Loop.run ~loop () : bool);
+  ignore (Luv.Loop.run ~loop ?mode () : bool);
   Lf_queue.close st.run_q;
   Luv.Handle.close async (fun () -> Luv.Loop.close loop |> or_raise);
   match !main_status with

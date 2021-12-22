@@ -102,7 +102,7 @@ let test_iovec () =
     );
   Alcotest.(check string) "Transfer correct" "Got [foo] and [bar]" (Cstruct.to_string message)
 
-let () =
+(* let () =
   let open Alcotest in
   run "eioio" [
     "io", [
@@ -112,4 +112,4 @@ let () =
       test_case "poll_add_busy" `Quick test_poll_add_busy;
       test_case "iovec"         `Quick test_iovec;
     ];
-  ]
+  ] *)

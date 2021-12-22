@@ -73,6 +73,11 @@ module File : sig
 
   val mkdir : mode:Luv.File.Mode.t list -> string -> unit or_error
   (** Wraps {!Luv.File.mkdir} *)
+
+  val await_readable : Unix.file_descr -> (unit -> unit) -> unit lazy_t
+
+  val await_writable : Unix.file_descr -> (unit -> unit) -> unit lazy_t
+
 end
 
 module Handle : sig
@@ -120,4 +125,4 @@ end
 
 (** {1 Main Loop} *)
 
-val run : (Objects.stdenv -> unit) -> unit
+val run : ?mode:Luv.Loop.Run_mode.t -> (Objects.stdenv -> unit) -> unit
