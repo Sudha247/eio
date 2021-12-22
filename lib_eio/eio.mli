@@ -105,7 +105,7 @@ module Std : sig
     (** [break u ex] resolves [u]'s promise with the exception [ex].
         Any threads waiting for the result will be added to the run queue. *)
 
-    val resolve : 'a t -> ('a, exn) result -> unit
+    val resolve : 'a u -> ('a, exn) result -> unit
     (** [resolve t (Ok x)] is [fulfill t x] and
         [resolve t (Error ex)] is [break t ex]. *)
 
@@ -137,6 +137,10 @@ module Std : sig
         if either raises an exception, the other is cancelled.
         [both] waits for both functions to finish even if one raises
         (it will then re-raise the original exception).
+        [f] runs immediately, without switching to any other thread.
+        [g] is inserted at the head of the run-queue, so it runs next even if other threads are already enqueued.
+        You can get other scheduling orders by adding calls to {!yield} in various places.
+        e.g. to append both fibres to the end of the run-queue, yield immediately before calling [both].
         @raise Multiple_exn.T if both fibres raise exceptions (excluding {!Cancel.Cancelled}). *)
 
     val pair : (unit -> 'a) -> (unit -> 'b) -> 'a * 'b
@@ -150,6 +154,7 @@ module Std : sig
     (** [first f g] runs [f ()] and [g ()] concurrently.
         They run in a new cancellation sub-context, and when one finishes the other is cancelled.
         If one raises, the other is cancelled and the exception is reported.
+        As with [both], [f] runs immediately and [g] is scheduled next, ahead of any other queued work.
         @raise Multiple_exn.T if both fibres raise exceptions (excluding {!Cancel.Cancelled} when cancelled). *)
 
     val any : (unit -> 'a) list -> 'a
@@ -160,30 +165,38 @@ module Std : sig
     (** [await_cancel ()] waits until cancelled.
         @raise Cancel.Cancelled *)
 
-    val fork_ignore : sw:Switch.t -> (unit -> unit) -> unit
-    (** [fork_ignore ~sw fn] runs [fn ()] in a new fibre, but does not wait for it to complete.
+    val fork : sw:Switch.t -> (unit -> unit) -> unit
+    (** [fork ~sw fn] runs [fn ()] in a new fibre, but does not wait for it to complete.
         The new fibre is attached to [sw] (which can't finish until the fibre ends).
         The new fibre inherits [sw]'s cancellation context.
         If the fibre raises an exception, [sw] is turned off.
-        If [sw] is already off then [fn] fails immediately, but the calling thread continues. *)
+        If [sw] is already off then [fn] fails immediately, but the calling thread continues.
+        [fn] runs immediately, without switching to any other fibre first.
+        The calling fibre is placed at the head of the run queue, ahead of any previous items. *)
 
-    val fork_sub_ignore : ?on_release:(unit -> unit) -> sw:Switch.t -> on_error:(exn -> unit) -> (Switch.t -> unit) -> unit
-    (** [fork_sub_ignore ~sw ~on_error fn] is like [fork_ignore], but it creates a new sub-switch for the fibre.
+    val fork_sub : ?on_release:(unit -> unit) -> sw:Switch.t -> on_error:(exn -> unit) -> (Switch.t -> unit) -> unit
+    (** [fork_sub ~sw ~on_error fn] is like [fork], but it creates a new sub-switch for the fibre.
         This means that you can cancel the child switch without cancelling the parent.
-        This is a convenience function for running {!Switch.run} inside a {!fork_ignore}.
+        This is a convenience function for running {!Switch.run} inside a {!fork}.
         @param on_release If given, this function is called when the new fibre ends.
                           If the fibre cannot be created (e.g. because [sw] is already off), it runs immediately.
         @param on_error This is called if the fibre raises an exception (other than {!Cancel.Cancelled}).
                         If it raises in turn, the parent switch is turned off. *)
 
-    val fork : sw:Switch.t -> exn_turn_off:bool -> (unit -> 'a) -> 'a Promise.t
-    (** [fork ~sw ~exn_turn_off fn] starts running [fn ()] in a new fibre and returns a promise for its result.
-        The new fibre is attached to [sw] (which can't finish until the fibre ends).
-        @param exn_turn_off If [true] and [fn] raises an exception, [sw] is turned off (in addition to breaking the promise). *)
+    val fork_promise : sw:Switch.t -> (unit -> 'a) -> 'a Promise.t
+    (** [fork_promise ~sw fn] schedules [fn ()] to run in a new fibre and returns a promise for its result.
+        This is just a convenience wrapper around {!fork}.
+        If [fn] raises an exception then the promise is broken, but [sw] is not turned off. *)
+
+    val check : unit -> unit
+    (** [check ()] checks that the fibre's context hasn't been cancelled.
+        Many operations automatically check this before starting.
+        @raise Cancel.Cancelled if the fibre's context has been cancelled. *)
 
     val yield : unit -> unit
     (** [yield ()] asks the scheduler to switch to the next runnable task.
-        The current task remains runnable, but goes to the back of the queue. *)
+        The current task remains runnable, but goes to the back of the queue.
+        Automatically calls {!check} just before resuming. *)
   end
 
   val traceln :
@@ -267,7 +280,40 @@ end
 (** Cancelling other fibres when an exception occurs. *)
 module Cancel : sig
   (** This is the low-level interface to cancellation.
-      Every {!Switch} includes a cancellation context and most users will just use that API instead. *)
+      Every {!Switch} includes a cancellation context and most users will just use that API instead.
+
+      Each domain has a tree of cancellation contexts, and every fibre is registered with one context.
+      A fibre can switch to a different context (e.g. by calling {!sub}).
+      When a context is cancelled, all registered fibres have their current cancellation function (if any)
+      called and removed. Child contexts are cancelled too, recursively, unless marked as protected.
+
+      Many operations also check that the current context hasn't been cancelled,
+      so if a fibre is performing a non-cancellable operation it will still get cancelled soon afterwards.
+      This check is typically done when starting an operation, not at the end.
+      If an operation is cancelled after succeeding, but while still waiting on the run queue,
+      it will still return the operation's result.
+      A notable exception is {!Fibre.yield}, which checks at the end.
+      You can also use {!Fibre.check} to check manually.
+
+      Whether a fibre is cancelled through a cancellation function or by checking its context,
+      it will receive a {!Cancelled} exception.
+      It is possible the exception will get lost (if something catches it and forgets to re-raise).
+      It is also possible to get this exception even when not cancelled, for example by awaiting
+      a promise which another fibre has resolved to a cancelled exception.
+      When in doubt, call {!Fibre.check ()} to find out if your fibre is really cancelled.
+      Ideally this should be done any time you have caught an exception and are planning to ignore it,
+      although if you forget then the next IO operation will typically abort anyway.
+
+      Quick clean-up actions (such as releasing a mutex or deleting a temporary file) are OK,
+      but operations that may block should be avoided.
+      For example, a network connection should simply be closed,
+      without attempting to send a goodbye message.
+
+      A [Cancelled] exception will eventually be caught by the structure that sent it.
+      For example, if {!Fibre.both} gets a regular exception [ex] from one of its branches
+      it will send a [Cancelled ex] exception to the other one.
+      When that branch later fails with the [Cancelled ex] exception,
+      [Fibre.both] will handle it by raising the original [ex] again. *)
 
   type t
   (** A cancellation context. *)
@@ -288,7 +334,8 @@ module Cancel : sig
   val protect : (unit -> 'a) -> 'a
   (** [protect fn] runs [fn] in a new cancellation context that isn't cancelled when its parent is.
       This can be used to clean up resources on cancellation.
-      However, it is usually better to use {!Switch.on_release} (which calls this for you). *)
+      However, it is usually better to use {!Switch.on_release} (which calls this for you).
+      Note that [protect] does not check its parent context when it finishes. *)
 
   val check : t -> unit
   (** [check t] checks that [t] hasn't been cancelled.
@@ -299,9 +346,10 @@ module Cancel : sig
       If [t] is finished, this returns (rather than raising) the [Invalid_argument] exception too. *)
 
   val cancel : t -> exn -> unit
-  (** [cancel t ex] marks [t] as cancelled and then calls all registered hooks,
-      passing [ex] as the argument.
-      All hooks are run, even if some of them raise exceptions.
+  (** [cancel t ex] marks [t] and its child contexts as cancelled, recursively,
+      and calls all registered fibres' cancellation functions, passing [Cancelled ex] as the argument.
+      All cancellation functions are run, even if some of them raise exceptions.
+      If [t] is already cancelled then this does nothing.
       @raise Cancel_hook_failed if one or more hooks fail. *)
 end
 
@@ -426,21 +474,22 @@ module Net : sig
     (sw:Switch.t -> <Flow.two_way; Flow.close> -> Sockaddr.t -> unit) ->
     unit
   (** [accept socket fn] waits for a new connection to [socket] and then runs [fn ~sw flow client_addr] in a new fibre,
-      created with [Fibre.fork_sub_ignore].
+      created with [Fibre.fork_sub].
       [flow] will be closed automatically when the sub-switch is finished, if not already closed by then. *)
 
   class virtual t : object
-    method virtual listen : reuse_addr:bool -> backlog:int -> sw:Switch.t -> Sockaddr.t -> listening_socket
+    method virtual listen : reuse_addr:bool -> reuse_port:bool -> backlog:int -> sw:Switch.t -> Sockaddr.t -> listening_socket
     method virtual connect : sw:Switch.t -> Sockaddr.t -> <Flow.two_way; Flow.close>
   end
 
-  val listen : ?reuse_addr:bool -> backlog:int -> sw:Switch.t -> #t -> Sockaddr.t -> listening_socket
+  val listen : ?reuse_addr:bool -> ?reuse_port:bool -> backlog:int -> sw:Switch.t -> #t -> Sockaddr.t -> listening_socket
   (** [listen ~sw ~backlog t addr] is a new listening socket bound to local address [addr].
       The new socket will be closed when [sw] finishes, unless closed manually first.
       For (non-abstract) Unix domain sockets, the path will be removed afterwards.
       @param backlog The number of pending connections that can be queued up (see listen(2)).
       @param reuse_addr Set the [Unix.SO_REUSEADDR] socket option.
-                        For Unix paths, also remove any stale left-over socket. *)
+                        For Unix paths, also remove any stale left-over socket.
+      @param reuse_port Set the [Unix.SO_REUSEPORT] socket option. *)
 
   val connect : sw:Switch.t -> #t -> Sockaddr.t -> <Flow.two_way; Flow.close>
   (** [connect ~sw t addr] is a new socket connected to remote address [addr].
@@ -449,15 +498,18 @@ end
 
 module Domain_manager : sig
   class virtual t : object
-    method virtual run : 'a. (unit -> 'a) -> 'a
     method virtual run_raw : 'a. (unit -> 'a) -> 'a
+
+    method virtual run : 'a. (unit -> 'a) -> 'a
+    (** Note: cancellation is handled by the {!run} wrapper function, not the object. *)
   end
 
   val run : #t -> (unit -> 'a) -> 'a
   (** [run t f] runs [f ()] in a newly-created domain and returns the result.
       Other fibres in the calling domain can run in parallel with the new domain.
       Warning: [f] must only access thread-safe values from the calling domain,
-      but this is not enforced by the type system. *)
+      but this is not enforced by the type system.
+      If the calling fibre is cancelled, this is propagated to the spawned domain. *)
 
   val run_raw : #t -> (unit -> 'a) -> 'a
   (** [run_raw t f] is like {!run}, but does not run an event loop in the new domain,
@@ -604,8 +656,11 @@ module Private : sig
   module Fibre_context : sig
     type t
 
-    val make : tid:Ctf.id -> cc:Cancel.t -> t
-    (** [make ~tid ~cc] is a new context with the given thread ID and cancellation context. *)
+    val make_root : unit -> t
+    (** Make a new root context for a new domain. *)
+
+    val make : cc:Cancel.t -> t
+    (** [make ~cc] is a new fibre context, initially attached to the given cancellation context. *)
 
     val destroy : t -> unit
     (** [destroy t] removes [t] from its cancellation context. *)
@@ -648,11 +703,8 @@ module Private : sig
           passing it the suspended fibre's context and a function to resume it.
           [fn] should arrange for [enqueue] to be called once the thread is ready to run again. *)
 
-      | Fork : (Fibre_context.t -> 'a) -> 'a Promise.t eff
+      | Fork : Fibre_context.t * (unit -> unit) -> unit eff
       (** See {!Fibre.fork} *)
-
-      | Fork_ignore : (Fibre_context.t -> unit) -> unit eff
-      (** See {!Fibre.fork_ignore} *)
 
       | Trace : (?__POS__:(string * int * int * int) -> ('a, Format.formatter, unit, unit) format4 -> 'a) eff
       (** [perform Trace fmt] writes trace logging to the configured trace output.
@@ -662,8 +714,4 @@ module Private : sig
 
       | Get_context : Fibre_context.t eff
   end
-
-  val boot_cancel : Cancel.t
-  (** A dummy context which is useful briefly during start up before the backend calls {!Cancel.protect}
-      to install a proper context. *)
 end

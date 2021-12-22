@@ -26,7 +26,6 @@ type state =
    If cancelled, this is done by calling the cancellation function. *)
 type t = {
   mutable state : state;
-  parent : t;
   children : t Lwt_dllist.t;
   fibres : fibre_context Lwt_dllist.t;
   protected : bool;
@@ -38,16 +37,13 @@ and fibre_context = {
   cancel_fn : (exn -> unit) option Atomic.t;
 }
 
-(* A dummy value for bootstrapping *)
-let rec boot = {
-  state = Finished;
-  parent = boot;
-  children = Lwt_dllist.create ();
-  fibres = Lwt_dllist.create ();
-  protected = false;
-}
-
 type _ eff += Get_context : fibre_context eff
+
+let combine_exn e1 e2 =
+  match e1, e2 with
+  | (Cancelled _), e
+  | e, (Cancelled _) -> e  (* Don't need to report a cancelled exception if we have something better *)
+  | _ -> Multiple_exn.T [e1; e2]
 
 let cancelled t =
   match t.state with
@@ -78,11 +74,15 @@ let move_fibre_to t fibre =
   Option.iter Lwt_dllist.remove fibre.cancel_node;      (* Remove from old context *)
   fibre.cancel_node <- Some new_node
 
-(* Runs [fn] with a fresh cancellation context. *)
-let with_cc ~ctx:fibre ~parent ~protected fn =
+(* Note: the new value is not linked into the cancellation tree. *)
+let create ~protected =
   let children = Lwt_dllist.create () in
   let fibres = Lwt_dllist.create () in
-  let t = { state = On; parent; children; protected; fibres } in
+  { state = On; children; protected; fibres }
+
+(* Runs [fn] with a fresh cancellation context. *)
+let with_cc ~ctx:fibre ~parent ~protected fn =
+  let t = create ~protected in
   let node = Lwt_dllist.add_r t parent.children in
   move_fibre_to t fibre;
   let cleanup () =
@@ -101,44 +101,51 @@ let protect fn =
   check t;
   x
 
-let rec cancel t ex =
+let rec cancel_internal t ex acc_fns =
   match t.state with
   | Finished -> invalid_arg "Cancellation context finished!"
-  | Cancelling _ -> ()
+  | Cancelling _ -> acc_fns
   | On ->
     let bt = Printexc.get_raw_backtrace () in
     t.state <- Cancelling (ex, bt);
-    let cex = Cancelled ex in
-    let rec aux () =
+    let rec aux acc_fns =
       match Lwt_dllist.take_opt_r t.fibres with
-      | None -> Lwt_dllist.fold_r (cancel_child ex) t.children []
+      | None -> Lwt_dllist.fold_r (cancel_child ex) t.children acc_fns
       | Some fibre ->
         match Atomic.exchange fibre.cancel_fn None with
-        | None -> aux ()        (* The operation succeeded and so can't be cancelled now *)
-        | Some cancel_fn ->
-          match cancel_fn cex with
-          | () -> aux ()
-          | exception ex2 -> ex2 :: aux ()
+        | None -> aux acc_fns        (* The operation succeeded and so can't be cancelled now *)
+        | Some cancel_fn -> cancel_fn :: aux acc_fns
     in
-    match protect aux with
-    | [] -> ()
-    | exns -> raise (Cancel_hook_failed exns)
+    aux acc_fns
 and cancel_child ex t acc =
   if t.protected then acc
-  else match cancel t ex with
-    | () -> acc
-    | exception ex -> ex :: acc
+  else cancel_internal t ex acc
+
+let cancel t ex =
+  let fns = cancel_internal t ex [] in
+  let cex = Cancelled ex in
+  let rec aux = function
+    | [] -> []
+    | fn :: fns ->
+      match fn cex with
+      | () -> aux fns
+      | exception ex2 -> ex2 :: aux fns
+  in
+  match protect (fun () -> aux fns) with
+  | [] -> ()
+  | exns -> raise (Cancel_hook_failed exns)
 
 let sub fn =
   let ctx = perform Get_context in
-  with_cc ~ctx ~parent:ctx.cancel_context ~protected:false @@ fun t ->
+  let parent = ctx.cancel_context in
+  with_cc ~ctx ~parent ~protected:false @@ fun t ->
   let x =
     match fn t with
     | x ->
-      check t.parent;
+      check parent;
       x
     | exception ex ->
-      check t.parent;
+      check parent;
       raise ex
   in
   match t.state with
@@ -150,9 +157,10 @@ let sub fn =
    (instead, return the parent context on exit so the caller can check that) *)
 let sub_unchecked fn =
   let ctx = perform Get_context in
-  with_cc ~ctx ~parent:ctx.cancel_context ~protected:false @@ fun t ->
+  let parent = ctx.cancel_context in
+  with_cc ~ctx ~parent ~protected:false @@ fun t ->
   fn t;
-  t.parent
+  parent
 
 module Fibre_context = struct
   type t = fibre_context
@@ -169,10 +177,14 @@ module Fibre_context = struct
   let clear_cancel_fn t =
     Atomic.exchange t.cancel_fn None <> None
 
-  let make ~tid ~cc =
+  let make ~cc =
+    let tid = Ctf.mint_id () in
+    Ctf.note_created tid Ctf.Task;
     let t = { tid; cancel_context = cc; cancel_node = None; cancel_fn = Atomic.make None } in
     t.cancel_node <- Some (Lwt_dllist.add_r t cc.fibres);
     t
+
+  let make_root () = make ~cc:(create ~protected:false)
 
   let destroy t =
     Option.iter Lwt_dllist.remove t.cancel_node

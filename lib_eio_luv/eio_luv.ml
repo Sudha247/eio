@@ -98,6 +98,11 @@ let enqueue_failed_thread t k ex =
   Lf_queue.push t.run_q (fun () -> Suspended.discontinue k ex);
   Luv.Async.send t.async |> or_raise
 
+(* Can only be called from our domain. *)
+let enqueue_at_head t k v =
+  Lf_queue.push_head t.run_q (fun () -> Suspended.continue k v);
+  Luv.Async.send t.async |> or_raise
+
 let await_exn fn =
   perform (Await fn) |> or_raise
 
@@ -276,7 +281,7 @@ module Stream = struct
     let r = enter (fun t k ->
         Fibre_context.set_cancel_fn k.fibre (fun ex ->
             Luv.Stream.read_stop (Handle.get "read_into:cancel" sock) |> or_raise;
-            enqueue_failed_thread t k (Eio.Cancel.Cancelled ex)
+            enqueue_failed_thread t k ex
           );
         Luv.Stream.read_start (Handle.get "read_start" sock) ~allocate:(fun _ -> buf) (fun r ->
             Luv.Stream.read_stop (Handle.get "read_stop" sock) |> or_raise;
@@ -322,17 +327,6 @@ let sleep_until due =
   Luv.Timer.start timer delay (fun () ->
       if Fibre_context.clear_cancel_fn k.fibre then enqueue_thread st k ()
     ) |> or_raise
-
-let run_compute fn =
-  match_with fn ()
-  { retc = (fun x -> x);
-    exnc = (fun e -> raise e);
-    effc = fun (type a) (e: a eff) -> 
-      match e with 
-      | Eio.Private.Effects.Trace -> 
-        Some (fun (k : (a,_) continuation) -> continue k Eunix.Trace.default_traceln)
-      | _ -> None
-  }
 
 module Objects = struct
   type _ Eio.Generic.ty += FD : File.t Eio.Generic.ty
@@ -423,7 +417,7 @@ module Objects = struct
         Handle.close client;
         raise (Luv_error e)
       | Ok () ->
-        Fibre.fork_sub_ignore ~sw ~on_error
+        Fibre.fork_sub ~sw ~on_error
           (fun sw ->
              let client_addr = self#get_client_addr client in
              fn ~sw (socket client :> <Eio.Flow.two_way; Eio.Flow.close>) client_addr
@@ -441,6 +435,7 @@ module Objects = struct
      Luv makes TCP sockets reuse_addr by default, and maybe that's fine everywhere.
      Extracting the FD will require https://github.com/aantron/luv/issues/120 *)
   let luv_reuse_addr _sock _v = ()
+  let luv_reuse_port _sock _v = ()
 
   (* This is messy. Should make a generic sockaddr type for eio. *)
   let luv_addr_of_unix host port =
@@ -474,10 +469,11 @@ module Objects = struct
   let net = object
     inherit Eio.Net.t
 
-    method listen ~reuse_addr ~backlog ~sw = function
+    method listen ~reuse_addr ~reuse_port ~backlog ~sw = function
       | `Tcp (host, port) ->
         let sock = Luv.TCP.init ~loop:(get_loop ()) () |> or_raise |> Handle.of_luv ~sw in
         luv_reuse_addr sock reuse_addr;
+        luv_reuse_port sock reuse_port;
         let addr = luv_addr_of_unix host port in
         Luv.TCP.bind (Handle.get "bind" sock) addr |> or_raise;
         listening_ip_socket ~backlog sock
@@ -538,7 +534,7 @@ module Objects = struct
       in
       enter @@ fun _st k ->
       let d = Domain.spawn (fun () ->
-          result := Some (match run_compute fn with
+          result := Some (match fn () with
               | v -> Ok v
               | exception ex -> Error ex
             );
@@ -671,7 +667,7 @@ let rec run ?mode main =
   let stdenv = Objects.stdenv ~run_event_loop:(run ?mode) in
   let rec fork ~tid ~cancel:initial_cancel fn =
     Ctf.note_switch tid;
-    let fibre = Fibre_context.make ~tid ~cc:initial_cancel in
+    let fibre = Fibre_context.make ~cc:initial_cancel in
     match_with fn fibre
     { retc = (fun () -> Fibre_context.destroy fibre);
       exnc = (fun e -> Fibre_context.destroy fibre; raise e);
@@ -683,35 +679,16 @@ let rec run ?mode main =
             fn loop fibre (enqueue_thread st k))
         | Eio.Private.Effects.Trace ->
           Some (fun k -> continue k Eunix.Trace.default_traceln)
-        | Eio.Private.Effects.Fork f ->
+        | Eio.Private.Effects.Fork (new_fibre, f) ->
           Some (fun k -> 
             let k = { Suspended.k; fibre } in
-            let id = Ctf.mint_id () in
-            Ctf.note_created id Ctf.Task;
-            let promise, resolver = Promise.create_with_id id in
-            enqueue_thread st k promise;
-            fork
-              ~tid:id
-              ~cancel:(Fibre_context.cancellation_context fibre)
-              (fun new_fibre ->
-                 match f new_fibre with
-                 | x -> Promise.fulfill resolver x
-                 | exception ex ->
-                   Log.debug (fun f -> f "Forked fibre failed: %a" Fmt.exn ex);
-                   Promise.break resolver ex
-              ))
-        | Eio.Private.Effects.Fork_ignore f ->
-          Some (fun k -> 
-            let k = { Suspended.k; fibre } in
-            enqueue_thread st k ();
-            let child = Ctf.note_fork () in
-            Ctf.note_switch child;
-            fork ~tid:child ~cancel:(Fibre_context.cancellation_context fibre) (fun new_fibre ->
-                match f new_fibre with
+            enqueue_at_head st k ();
+            fork ~new_fibre (fun () ->
+                match f () with
                 | () ->
-                  Ctf.note_resolved child ~ex:None
+                  Ctf.note_resolved (Fibre_context.tid new_fibre) ~ex:None
                 | exception ex ->
-                  Ctf.note_resolved child ~ex:(Some ex)
+                  Ctf.note_resolved (Fibre_context.tid new_fibre) ~ex:(Some ex)
               ))
         | Eio.Private.Effects.Get_context -> Some (fun k -> continue k fibre)
         | Enter_unchecked fn -> Some (fun k ->
@@ -731,8 +708,9 @@ let rec run ?mode main =
     }
   in
   let main_status = ref `Running in
-  fork ~tid:(Ctf.mint_id ()) ~cancel:Eio.Private.boot_cancel (fun _new_fibre ->
-      begin match Eio.Cancel.protect (fun () -> main stdenv) with
+  let new_fibre = Fibre_context.make_root () in
+  fork ~new_fibre (fun () ->
+      begin match main stdenv with
         | () -> main_status := `Done
         | exception ex -> main_status := `Ex (ex, Printexc.get_raw_backtrace ())
       end;

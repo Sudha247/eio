@@ -169,6 +169,10 @@ let enqueue_failed_thread st k ex =
   Lf_queue.push st.run_q (Failed_thread (k, ex));
   if Atomic.get st.need_wakeup then wakeup st
 
+(* Can only be called from our own domain, so no need to check for wakeup. *)
+let enqueue_at_head st k x =
+  Lf_queue.push_head st.run_q (Thread (k, x))
+
 type _ eff += Enter_unchecked : (t -> 'a Suspended.t -> unit) -> 'a eff
 type _ eff += Enter : (t -> 'a Suspended.t -> unit) -> 'a eff
 let enter fn = perform (Enter fn)
@@ -784,7 +788,7 @@ module Objects = struct
     method accept_sub ~sw ~on_error fn =
       Switch.check sw;
       let client, client_addr = accept_loose_fd fd in
-      Fibre.fork_sub_ignore ~sw ~on_error
+      Fibre.fork_sub ~sw ~on_error
         (fun sw ->
            let client_addr = match client_addr with
              | Unix.ADDR_UNIX path         -> `Unix path
@@ -798,7 +802,7 @@ module Objects = struct
   let net = object
     inherit Eio.Net.t
 
-    method listen ~reuse_addr ~backlog ~sw listen_addr =
+    method listen ~reuse_addr ~reuse_port  ~backlog ~sw listen_addr =
       let socket_domain, socket_type, addr =
         match listen_addr with
         | `Unix path         ->
@@ -821,6 +825,8 @@ module Objects = struct
       end;
       if reuse_addr then
         Unix.setsockopt sock_unix Unix.SO_REUSEADDR true;
+      if reuse_port then
+        Unix.setsockopt sock_unix Unix.SO_REUSEPORT true;
       let sock = FD.of_unix ~sw ~seekable:false sock_unix in
       Unix.bind sock_unix addr;
       Unix.listen sock_unix backlog;
@@ -994,17 +1000,16 @@ let rec run ?(queue_depth=64) ?(block_size=4096) main =
   let eventfd = FD.placeholder ~seekable:false in
   let st = { mem; uring; run_q; eventfd_mutex; io_q; mem_q; eventfd; need_wakeup = Atomic.make false; sleep_q; io_jobs = 0 } in
   Log.debug (fun l -> l "starting main thread");
-  let rec fork ~tid ~cancel:initial_cancel fn =
-    Ctf.note_switch tid;
-    let fibre = Fibre_context.make ~tid ~cc:initial_cancel in
-    match_with fn fibre
+  let rec fork ~new_fibre:fibre fn =
+    Ctf.note_switch (Fibre_context.tid fibre);
+    match_with fn ()
       { retc = (fun () -> Fibre_context.destroy fibre; schedule st);
         exnc = (fun ex ->
             Fibre_context.destroy fibre;
             Printexc.raise_with_backtrace ex (Printexc.get_raw_backtrace ())
           );
-        effc = fun (type a) (e : a eff) ->  
-          match e with 
+        effc = fun (type a) (e : a eff) ->
+          match e with
           | Enter fn -> Some (fun k ->
               match Fibre_context.get_error fibre with
               | Some e -> discontinue k e
@@ -1018,21 +1023,21 @@ let rec run ?(queue_depth=64) ?(block_size=4096) main =
               fn st k;
               schedule st
             )
-          | ERead args -> Some (fun k -> 
+          | ERead args -> Some (fun k ->
               let k = { Suspended.k; fibre } in
               enqueue_read st k args;
               schedule st)
-          | Close fd -> Some (fun k -> 
+          | Close fd -> Some (fun k ->
               let k = { Suspended.k; fibre } in
               enqueue_close st k fd;
               schedule st
             )
-          | EWrite args -> Some (fun k -> 
+          | EWrite args -> Some (fun k ->
               let k = { Suspended.k; fibre } in
               enqueue_write st k args;
               schedule st
             )
-          | Sleep_until time -> Some (fun k -> 
+          | Sleep_until time -> Some (fun k ->
               let k = { Suspended.k; fibre } in
               match Fibre_context.get_error fibre with
               | Some ex -> Suspended.discontinue k ex
@@ -1045,7 +1050,7 @@ let rec run ?(queue_depth=64) ?(block_size=4096) main =
                 schedule st
             )
           | Eio.Private.Effects.Get_context -> Some (fun k -> continue k fibre)
-          | Eio.Private.Effects.Suspend f -> Some (fun k -> 
+          | Eio.Private.Effects.Suspend f -> Some (fun k ->
               let k = { Suspended.k; fibre } in
               f fibre (function
                   | Ok v -> enqueue_thread st k v
@@ -1053,42 +1058,23 @@ let rec run ?(queue_depth=64) ?(block_size=4096) main =
                 );
               schedule st
             )
-          | Eio.Private.Effects.Fork f -> Some (fun k -> 
+          | Eio.Private.Effects.Fork (new_fibre, f) -> Some (fun k ->
               let k = { Suspended.k; fibre } in
-              let id = Ctf.mint_id () in
-              Ctf.note_created id Ctf.Task;
-              let promise, resolver = Promise.create_with_id id in
-              enqueue_thread st k promise;
-              fork
-                ~tid:id
-                ~cancel:(Fibre_context.cancellation_context fibre)
-                (fun new_fibre ->
-                   match f new_fibre with
-                   | x -> Promise.fulfill resolver x
-                   | exception ex ->
-                     Log.debug (fun f -> f "Forked fibre failed: %a" Fmt.exn ex);
-                     Promise.break resolver ex
-                )
-            )
-          | Eio.Private.Effects.Fork_ignore f -> Some (fun k -> 
-              let k = { Suspended.k; fibre } in
-              enqueue_thread st k ();
-              let child = Ctf.note_fork () in
-              Ctf.note_switch child;
-              fork ~tid:child ~cancel:(Fibre_context.cancellation_context fibre) (fun new_fibre ->
-                  match f new_fibre with
+              enqueue_at_head st k ();
+              fork ~new_fibre (fun () ->
+                  match f () with
                   | () ->
-                    Ctf.note_resolved child ~ex:None
+                    Ctf.note_resolved (Fibre_context.tid new_fibre) ~ex:None
                   | exception ex ->
-                    Ctf.note_resolved child ~ex:(Some ex)
+                    Ctf.note_resolved (Fibre_context.tid new_fibre) ~ex:(Some ex)
                 )
             )
           | Eio.Private.Effects.Trace -> Some (fun k -> continue k Eunix.Trace.default_traceln)
-          | Alloc -> Some (fun k -> 
+          | Alloc -> Some (fun k ->
               let k = { Suspended.k; fibre } in
               alloc_buf st k
             )
-          | Free buf -> Some (fun k -> 
+          | Free buf -> Some (fun k ->
               free_buf st buf;
               continue k ()
             )
@@ -1096,7 +1082,8 @@ let rec run ?(queue_depth=64) ?(block_size=4096) main =
       }
   in
   let `Exit_scheduler =
-    fork ~tid:(Ctf.mint_id ()) ~cancel:Eio.Private.boot_cancel (fun _fibre ->
+    let new_fibre = Fibre_context.make_root () in
+    fork ~new_fibre (fun () ->
         Switch.run_protected (fun sw ->
             let fd = eio_eventfd 0 in
             st.eventfd.fd <- `Open fd;

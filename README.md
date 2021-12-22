@@ -26,6 +26,10 @@ This is an unreleased repository, as it's very much a work-in-progress.
 * [Time](#time)
 * [Multicore Support](#multicore-support)
 * [Design Note: Thread-Safety](#design-note-thread-safety)
+* [Synchronisation Tools](#synchronisation-tools)
+  * [Promises](#promises)
+  * [Streams](#streams)
+  * [Example: a worker pool](#example-a-worker-pool)
 * [Design Note: Determinism](#design-note-determinism)
 * [Examples](#examples)
 * [Further Reading](#further-reading)
@@ -227,7 +231,10 @@ What happened here was:
 5. The first thread's `yield` raised a `Cancelled` exception there.
 6. Once both threads had finished, `Fibre.both` re-raised the original exception.
 
-You should assume that any operation that can switch fibres can also raise a `Cancelled` exception if a sibling fibre crashes. 
+There is a tree of cancellation contexts for each domain, and every fibre is in one context.
+When an exception is raised, it propagates towards the root until handled, cancelling the other branches as it goes.
+You should assume that any operation that can switch fibres can also raise a `Cancelled` exception if an uncaught exception
+reaches one of its ancestor cancellation contexts.
 
 If you want to make an operation non-cancellable, wrap it with `Cancel.protect`
 (this creates a new context that isn't cancelled with its parent).
@@ -263,10 +270,10 @@ For example:
 ```ocaml
 # Eio_main.run @@ fun _env ->
   Switch.run (fun sw ->
-    Fibre.fork_ignore ~sw
+    Fibre.fork ~sw
       (fun () -> for i = 1 to 3 do traceln "i = %d" i; Fibre.yield () done);
     traceln "First thread forked";
-    Fibre.fork_ignore ~sw
+    Fibre.fork ~sw
       (fun () -> for j = 1 to 3 do traceln "j = %d" j; Fibre.yield () done);
     traceln "Second thread forked; top-level code is finished"
   );
@@ -274,8 +281,8 @@ For example:
 +i = 1
 +First thread forked
 +j = 1
-+i = 2
 +Second thread forked; top-level code is finished
++i = 2
 +j = 2
 +i = 3
 +j = 3
@@ -295,13 +302,13 @@ and any files it opened have been closed.
 So, a `Switch.run` puts a bound on the lifetime of things created within it,
 leading to clearer code and avoiding resource leaks.
 
-For example, `fork_ignore` creates a new fibre that continues running after `fork_ignore` returns,
+For example, `fork` creates a new fibre that continues running after `fork` returns,
 so it needs to take a switch argument.
 
 Every switch also creates a new cancellation context,
 and you can turn off the switch to cancel all fibres within it.
 
-You can also use `Fibre.fork_sub_ignore` to create a child sub-switch.
+You can also use `Fibre.fork_sub` to create a child sub-switch.
 Turning off the parent switch will also turn off the child switch, but turning off the child doesn't disable the parent.
 
 For example, a web-server might use one switch for the whole server and then create one sub-switch for each incoming connection.
@@ -656,6 +663,179 @@ However, if `q` is wrapped by a mutex (as in 4) then the assertion could fail.
 The first `Queue.length` will lock and then release the queue, then the second will lock and release it again.
 Another domain could change the value between these two calls.
 
+## Synchronisation Tools
+
+Eio provides several sub-modules for communicating between fibres and domains.
+
+### Promises
+
+Promises are a simple and reliable way to communicate between fibres.
+One fibre can wait for a promise and another can resolve it:
+
+```ocaml
+# Eio_main.run @@ fun _ ->
+  let promise, resolver = Promise.create () in
+  Fibre.both
+    (fun () ->
+      traceln "Waiting for promise...";
+      let x = Promise.await promise in
+      traceln "x = %d" x
+    )
+    (fun () ->
+      traceln "Resolving promise";
+      Promise.fulfill resolver 42
+    );;
++Waiting for promise...
++Resolving promise
++x = 42
+- : unit = ()
+```
+
+A promise is initially "unresolved". It can then either become "fulfilled" (as in the example above) or "broken" (with an exception).
+Either way, the promise is then said to be "resolved". A promise can only be resolved once.
+Awaiting a promise that is already resolved immediately returns the resolved value
+(or raises the exception, if broken).
+
+Promises are one of the easiest tools to use safely:
+it doesn't matter whether you wait on a promise before or after it is resolved,
+and multiple fibres can wait for the same promise and will get the same result.
+Promises are thread-safe; you can wait for a promise in one domain and resolve it in another.
+
+Promises are also useful for integrating with callback-based libraries. For example:
+
+```ocaml
+let wrap fn x =
+  let promise, resolver = Promise.create () in
+  fn x
+    ~on_success:(Promise.resolve resolver)
+    ~on_error:(Promise.break resolver);
+  Promise.await promise
+```
+
+### Streams
+
+A stream is a bounded queue. Reading from an empty stream waits until an item is available.
+Writing to a full stream waits for space.
+
+```ocaml
+# Eio_main.run @@ fun _ ->
+  let stream = Eio.Stream.create 2 in
+  Fibre.both
+    (fun () ->
+       for i = 1 to 5 do
+         traceln "Adding %d..." i;
+         Eio.Stream.add stream i
+       done
+    )
+    (fun () ->
+       for i = 1 to 5 do
+         let x = Eio.Stream.take stream in
+         traceln "Got %d" x;
+         Fibre.yield ()
+       done
+    );;
++Adding 1...
++Adding 2...
++Adding 3...
++Got 1
++Adding 4...
++Got 2
++Adding 5...
++Got 3
++Got 4
++Got 5
+- : unit = ()
+```
+
+Here, we create a stream with a maximum size of 2 items.
+The first fibre added 1 and 2 to the stream, but had to wait before it could insert 3.
+
+A stream with a capacity of 1 acts like a mailbox.
+A stream with a capacity of 0 will wait until both the sender and receiver are ready.
+
+Streams are thread-safe and can be used to communicate between domains.
+
+### Example: a worker pool
+
+A useful pattern is a pool of workers reading from a stream of work items.
+Client fibres submit items to a stream and workers process the items:
+
+```ocaml
+let handle_job request =
+  Fibre.yield ();       (* (simulated work) *)
+  Printf.sprintf "Processed:%d" request
+
+let run_worker id stream =
+  traceln "Worker %s ready" id;
+  while true do
+    let request, reply = Eio.Stream.take stream in
+    traceln "Worker %s processing request %d" id request;
+    Promise.fulfill reply (handle_job request)
+  done
+
+let submit stream request =
+  let reply, resolve_reply = Promise.create () in
+  Eio.Stream.add stream (request, resolve_reply);
+  Promise.await reply
+```
+
+Each item in the stream is a request payload and a resolver for the reply promise.
+
+```ocaml
+# Eio_main.run @@ fun env ->
+  let domain_mgr = Eio.Stdenv.domain_mgr env in
+  Switch.run @@ fun sw ->
+  let stream = Eio.Stream.create 100 in
+  let spawn_worker name =
+    Fibre.fork ~sw (fun () ->
+       Eio.Domain_manager.run domain_mgr (fun () -> run_worker name stream)
+    )
+  in
+  spawn_worker "A";
+  spawn_worker "B";
+  Switch.run (fun sw ->
+     for i = 1 to 3 do
+       Fibre.fork ~sw (fun () ->
+         traceln "Client %d submitting job..." i;
+         traceln "Client %d got %s" i (submit stream i)
+       );
+       Fibre.yield ()
+     done;
+  );
+  raise Exit;;
++Worker A ready
++Worker B ready
++Client 1 submitting job...
++Worker A processing request 1
++Client 2 submitting job...
++Worker B processing request 2
++Client 3 submitting job...
++Client 1 got Processed:1
++Worker A processing request 3
++Client 2 got Processed:2
++Client 3 got Processed:3
+Exception: Stdlib.Exit.
+```
+
+In the code above, any exception raised while processing a job will exit the whole program.
+We might prefer to handle exceptions by sending them back to the client and continuing:
+
+```ocaml
+let run_worker id stream =
+  traceln "Worker %s ready" id;
+  while true do
+    let request, reply = Eio.Stream.take stream in
+    traceln "Worker %s processing request %d" id request;
+    match handle_job request with
+    | result -> Promise.fulfill reply result
+    | exception ex -> Promise.break reply ex; Fibre.check ()
+  done
+```
+
+The `Fibre.check ()` checks whether the worker itself has been cancelled, and exits the loop if so.
+It's not actually necessary in this case,
+because if we continue instead then the following `Stream.take` will perform the check anyway.
+
 ## Design Note: Determinism
 
 Within a domain, fibres are scheduled deterministically.
@@ -681,6 +861,9 @@ See Eio's own tests for examples, e.g., [tests/test_switch.md](tests/test_switch
 - [ocaml-multicore/retro-httpaf-bench](https://github.com/ocaml-multicore/retro-httpaf-bench) includes a simple HTTP server using Eio. It shows how to use Eio with `httpaf`, and how to use multiple domains for increased performance.
 
 ## Further Reading
+
+- [lib_eio/eio.mli](lib_eio/eio.mli) documents Eio's public API.
+- [doc/rationale.md](doc/rationale.md) describes some of Eio's design tradeoffs in more detail.
 
 Some background about the effects system can be found in:
 
