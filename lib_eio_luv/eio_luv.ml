@@ -248,28 +248,30 @@ module File = struct
     await_with_cancel ~request (fun loop -> Luv.File.mkdir ~loop ~request ~mode path)
 
 
-  let await_readable fd f =
+  let await_readable (fd: Unix.file_descr) callback =
     let p = Luv.Poll.init ~loop:(get_loop ()) (Obj.magic fd) in
     match p with
     | Ok poll ->
-      let _ = await_with_cancel_poll ~poll (fun _loop _fibre -> Luv.Poll.start poll [`READABLE;] (fun _ -> f ())) in
-      lazy(
+      let _ = await_with_cancel_poll ~poll (fun _loop _fibre -> Luv.Poll.start poll [`READABLE;] (fun _ -> callback ())) in
+      (* lazy(
         match Luv.Poll.stop poll with
         | Ok () -> ()
         | Error _e -> failwith "error"
-      )
+      ) *)
+      ()
     | Error _e -> failwith "error"
 
-  let await_writable fd f =
+  let await_writable (fd: Unix.file_descr) callback =
     let p = Luv.Poll.init ~loop:(get_loop ()) (Obj.magic fd) in
     match p with
     | Ok poll ->
-      let _ = await_with_cancel_poll ~poll (fun _loop _fibre -> Luv.Poll.start poll [`WRITABLE;] (fun _ -> f ())) in
-      lazy(
+      let _ = await_with_cancel_poll ~poll (fun _loop _fibre -> Luv.Poll.start poll [`WRITABLE;] (fun _ -> callback ())) in
+      (* lazy(
         match Luv.Poll.stop poll with
         | Ok () -> ()
         | Error _e -> failwith "error"
-      )
+      ) *)
+      ()
     | Error _e -> failwith "error"
 
 end

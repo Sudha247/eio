@@ -74,9 +74,9 @@ module File : sig
   val mkdir : mode:Luv.File.Mode.t list -> string -> unit or_error
   (** Wraps {!Luv.File.mkdir} *)
 
-  val await_readable : Unix.file_descr -> (unit -> unit) -> unit lazy_t
+  val await_readable : Unix.file_descr -> (unit -> unit) -> unit
 
-  val await_writable : Unix.file_descr -> (unit -> unit) -> unit lazy_t
+  val await_writable : Unix.file_descr -> (unit -> unit) -> unit
 
 end
 
