@@ -126,16 +126,16 @@ let await_with_cancel ~request fn =
         )
     )
 
-let await_with_cancel_poll ~poll fn =
+let await_w_cancel poll fn cancel_fn =
   enter (fun st k ->
     let cancel_reason = ref None in
     Eio.Private.Fibre_context.set_cancel_fn k.fibre (fun ex ->
-      cancel_reason := Some ex;
-      match Luv.Poll.stop poll with
-      | Ok () -> ()
-      | Error e -> Log.debug (fun f -> f "Cancel failed: %s" (Luv.Error.strerror e)));
-
-      fn st.loop (fun v ->
+        cancel_reason := Some ex;
+        match cancel_fn poll with
+        | Ok () -> ()
+        | Error e -> Log.debug (fun f -> f "Cancel failed: %s" (Luv.Error.strerror e))
+      );
+    fn st.loop (fun v ->
         if Eio.Private.Fibre_context.clear_cancel_fn k.fibre then (
           enqueue_thread st k v
         ) else (
@@ -144,7 +144,7 @@ let await_with_cancel_poll ~poll fn =
           enqueue_failed_thread st k (Option.get !cancel_reason)
         )
       )
-    )
+  )
 
 let get_loop () =
   enter_unchecked @@ fun t k ->
@@ -252,26 +252,14 @@ module File = struct
     let p = Luv.Poll.init ~loop:(get_loop ()) (Obj.magic fd) in
     match p with
     | Ok poll ->
-      let _ = await_with_cancel_poll ~poll (fun _loop _fibre -> Luv.Poll.start poll [`READABLE;] (fun _ -> callback ())) in
-      (* lazy(
-        match Luv.Poll.stop poll with
-        | Ok () -> ()
-        | Error _e -> failwith "error"
-      ) *)
-      ()
+      await_w_cancel poll (fun _loop _fibre -> Luv.Poll.start poll [`READABLE;] (fun _ -> callback ())) Luv.Poll.stop
     | Error _e -> failwith "error"
 
   let await_writable (fd: Unix.file_descr) callback =
     let p = Luv.Poll.init ~loop:(get_loop ()) (Obj.magic fd) in
     match p with
     | Ok poll ->
-      let _ = await_with_cancel_poll ~poll (fun _loop _fibre -> Luv.Poll.start poll [`WRITABLE;] (fun _ -> callback ())) in
-      (* lazy(
-        match Luv.Poll.stop poll with
-        | Ok () -> ()
-        | Error _e -> failwith "error"
-      ) *)
-      ()
+      await_w_cancel poll (fun _loop _fibre -> Luv.Poll.start poll [`WRITABLE;] (fun _ -> callback ())) Luv.Poll.stop
     | Error _e -> failwith "error"
 
 end
