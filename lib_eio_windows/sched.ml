@@ -338,6 +338,13 @@ let run ~extra_effects t main x =
               f fiber enqueue;
               next t
             )
+          | Suspend_interface.Sched.Suspend f -> Some (fun k ->
+            let k = {Suspended.k; fiber} in
+            let resumer v = get_enqueue t k v; true in
+            match (f resumer) with
+            | Some _ -> next t
+            | None -> Suspended.discontinue k Exit
+            )
           | Eio.Private.Effects.Fork (new_fiber, f) -> Some (fun k ->
               let k = { Suspended.k; fiber } in
               enqueue_at_head t k;

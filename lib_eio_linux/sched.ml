@@ -416,6 +416,20 @@ let run ~extra_effects st main arg =
                 );
               schedule st
             )
+          | Suspend_interface.Sched.Suspend f -> Some (fun k ->
+              let k = {Suspended.k; fiber} in
+              let resumer v =
+                begin
+                match v with
+                | Ok x -> enqueue_thread st k x; true
+                | Error ex -> enqueue_failed_thread st k ex; false
+                end
+              in begin
+              match (f resumer) with
+              | Some _ -> schedule st
+              | _ -> Suspended.discontinue k Exit
+              end;
+            )
           | Eio.Private.Effects.Fork (new_fiber, f) -> Some (fun k ->
               let k = { Suspended.k; fiber } in
               enqueue_at_head st k ();
