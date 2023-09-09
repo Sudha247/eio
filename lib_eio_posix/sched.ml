@@ -348,7 +348,13 @@ let run ~extra_effects t main x =
             )
           | Suspend_interface.Sched.Suspend f -> Some (fun k ->
             let k = {Suspended.k; fiber} in
-            let resumer v = get_enqueue t k v; true in
+            let resumer v =
+              begin
+                match v with
+                | Ok x -> enqueue_thread t k x; true
+                | Error ex -> enqueue_failed_thread t k ex; false
+              end
+            in
             match (f resumer) with
             | Some _ -> next t
             | None -> Suspended.discontinue k Exit
