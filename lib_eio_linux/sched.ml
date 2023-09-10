@@ -426,8 +426,8 @@ let run ~extra_effects st main arg =
                 end
               in begin
               match (f resumer) with
-              | Some _ -> schedule st
-              | _ -> Suspended.discontinue k Exit
+              | Some _ -> Suspended.discontinue k Exit
+              | _ -> schedule st
               end;
             )
           | Eio.Private.Effects.Fork (new_fiber, f) -> Some (fun k ->
