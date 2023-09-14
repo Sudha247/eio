@@ -416,7 +416,7 @@ let run ~extra_effects st main arg =
                 );
               schedule st
             )
-          | Suspend_interface.Sched.Suspend f -> Some (fun k ->
+          | Unified_interface.Sched.Suspend f -> Some (fun k ->
               let k = {Suspended.k; fiber} in
               let resumer v =
                 begin

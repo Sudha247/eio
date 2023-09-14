@@ -338,7 +338,7 @@ let run ~extra_effects t main x =
               f fiber enqueue;
               next t
             )
-          | Suspend_interface.Sched.Suspend f -> Some (fun k ->
+          | Unified_interface.Sched.Suspend f -> Some (fun k ->
             let k = {Suspended.k; fiber} in
             let resumer v = get_enqueue t k v; true in
             match (f resumer) with
