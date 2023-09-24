@@ -426,7 +426,7 @@ let run ~extra_effects st main arg =
                 end
               in begin
               match (f resumer) with
-              | Some _ -> Suspended.discontinue k Exit
+              | Some v -> Suspended.continue k v
               | _ -> schedule st
               end;
             )
